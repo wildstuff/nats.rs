@@ -996,7 +996,13 @@ impl tokio::io::AsyncRead for Object {
                                     ..Default::default()
                                 })
                                 .await
-                                .unwrap()
+                                .map_err(|err| {
+                                    let kind = match err.kind() {
+                                        ConsumerErrorKind::TimedOut => StreamErrorKind::TimedOut,
+                                        _ => StreamErrorKind::Other,
+                                    };
+                                    StreamError::with_source(kind, err)
+                                })?
                                 .messages()
                                 .await
                         }))
@@ -1004,7 +1010,11 @@ impl tokio::io::AsyncRead for Object {
                 };
                 match future.as_mut().poll(cx) {
                     Poll::Ready(subscription) => {
-                        self.subscription = Some(subscription.unwrap());
+                        self.subscription = Some(subscription.map_err(|err| {
+                            std::io::Error::other(format!(
+                                "failed to subscribe to object chunks: {err}"
+                            ))
+                        })?);
                     }
                     Poll::Pending => (),
                 }
