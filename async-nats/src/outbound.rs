@@ -14,7 +14,7 @@
 //! The outbound step: one process-global filter every message passes on
 //! its way out of this client.
 //!
-//! The client calls [`outbound`] at every site that hands a message to the
+//! The client calls its private `outbound` step at every site that hands a message to the
 //! connection task (each publish, each request, a JetStream publish),
 //! before the size check, and checks the size again on what the filter
 //! answered. It runs on the caller's task, never on the connection task,
