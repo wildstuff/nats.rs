@@ -90,48 +90,92 @@ pub fn outbound_filter_is_set() -> bool {
     FILTER.get().is_some()
 }
 
-/// The outbound step, for an async send site. Unset: the message as given.
-pub(crate) async fn outbound(
-    subject: &Subject,
+/// A message that has passed the outbound step: the subject it goes to and
+/// the headers and body the filter answered for it.
+///
+/// `Command::Publish` and `Command::Request` carry one, and only this module
+/// can build one (its fields and its constructor are private here), so a
+/// body that skipped the filter, or a body other than the one the filter
+/// answered, does not compile into a command.
+#[derive(Debug)]
+pub(crate) struct Filtered {
+    subject: Subject,
     headers: Option<HeaderMap>,
     payload: Bytes,
-) -> Result<Outgoing, tokio::task::JoinError> {
+}
+
+impl Filtered {
+    /// Private to this module: the seal.
+    fn new(subject: Subject, (headers, payload): Outgoing) -> Self {
+        Filtered {
+            subject,
+            headers,
+            payload,
+        }
+    }
+
+    pub(crate) fn headers(&self) -> Option<&HeaderMap> {
+        self.headers.as_ref()
+    }
+
+    pub(crate) fn payload_len(&self) -> usize {
+        self.payload.len()
+    }
+
+    /// Takes the message apart for the wire. A part taken out cannot be put
+    /// back into a `Filtered`.
+    pub(crate) fn into_parts(self) -> (Subject, Option<HeaderMap>, Bytes) {
+        (self.subject, self.headers, self.payload)
+    }
+}
+
+/// The outbound step, for an async send site. Unset: the message as given.
+pub(crate) async fn outbound(
+    subject: Subject,
+    headers: Option<HeaderMap>,
+    payload: Bytes,
+) -> Result<Filtered, tokio::task::JoinError> {
     outbound_with(FILTER.get().map(|f| &**f), subject, headers, payload).await
 }
 
 /// The outbound step, for a send site that cannot await (`Sink`): always
 /// inline.
 pub(crate) fn outbound_sync(
-    subject: &Subject,
+    subject: Subject,
     headers: Option<HeaderMap>,
     payload: Bytes,
-) -> Outgoing {
-    match FILTER.get() {
+) -> Filtered {
+    let outgoing = match FILTER.get() {
         None => (headers, payload),
         Some(filter) => filter(subject.as_str(), headers, payload),
-    }
+    };
+    Filtered::new(subject, outgoing)
 }
 
-pub(crate) async fn outbound_with(
+async fn outbound_with(
     filter: Option<&'static OutboundFilter>,
-    subject: &Subject,
+    subject: Subject,
     headers: Option<HeaderMap>,
     payload: Bytes,
-) -> Result<Outgoing, tokio::task::JoinError> {
+) -> Result<Filtered, tokio::task::JoinError> {
     let Some(filter) = filter else {
-        return Ok((headers, payload));
+        // Unarmed: no await point, no copy; the body moves through.
+        return Ok(Filtered::new(subject, (headers, payload)));
     };
     if payload.len() >= BLOCKING_THRESHOLD {
         // No runtime: scanned inline. `block_in_place` is never used — it
         // panics on a current-thread runtime.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let subject = subject.clone();
             return handle
-                .spawn_blocking(move || filter(subject.as_str(), headers, payload))
+                .spawn_blocking(move || {
+                    let outgoing = filter(subject.as_str(), headers, payload);
+                    Filtered::new(subject, outgoing)
+                })
                 .await;
         }
     }
-    Ok(filter(subject.as_str(), headers, payload))
+    let outgoing = filter(subject.as_str(), headers, payload);
+    Ok(Filtered::new(subject, outgoing))
 }
 
 #[cfg(test)]
@@ -163,22 +207,26 @@ mod tests {
     fn unset_returns_the_message_unchanged() {
         let subject = Subject::from_static("a.b");
         let payload = Bytes::from_static(b"body");
-        let (headers, body) = outbound_with(None, &subject, None, payload.clone())
+        let (sent_to, headers, body) = outbound_with(None, subject.clone(), None, payload.clone())
             .now_or_never()
             .expect("no await point when unset")
-            .unwrap();
+            .unwrap()
+            .into_parts();
+        assert_eq!(sent_to, subject);
         assert!(headers.is_none());
         assert_eq!(body, payload);
+        assert_eq!(body.as_ptr(), payload.as_ptr(), "the body is not copied");
     }
 
     #[test]
     fn large_body_without_a_runtime_is_filtered_inline() {
         let subject = Subject::from_static("a.b");
         let payload = Bytes::from(vec![b'x'; BLOCKING_THRESHOLD]);
-        let (_, body) = outbound_with(Some(thread_reporter()), &subject, None, payload)
+        let (_, _, body) = outbound_with(Some(thread_reporter()), subject, None, payload)
             .now_or_never()
             .expect("inline without a runtime")
-            .unwrap();
+            .unwrap()
+            .into_parts();
         assert_eq!(body, here());
     }
 
@@ -186,9 +234,10 @@ mod tests {
     async fn small_body_on_a_runtime_is_filtered_inline() {
         let subject = Subject::from_static("a.b");
         let payload = Bytes::from(vec![b'x'; BLOCKING_THRESHOLD - 1]);
-        let (_, body) = outbound_with(Some(thread_reporter()), &subject, None, payload)
+        let (_, _, body) = outbound_with(Some(thread_reporter()), subject, None, payload)
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         assert_eq!(body, here());
     }
 
@@ -196,9 +245,10 @@ mod tests {
     async fn large_body_on_a_runtime_goes_to_the_blocking_pool() {
         let subject = Subject::from_static("a.b");
         let payload = Bytes::from(vec![b'x'; BLOCKING_THRESHOLD]);
-        let (_, body) = outbound_with(Some(thread_reporter()), &subject, None, payload)
+        let (_, _, body) = outbound_with(Some(thread_reporter()), subject, None, payload)
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         assert_ne!(body, here());
     }
 
@@ -207,7 +257,7 @@ mod tests {
         let subject = Subject::from_static("a.b");
         let filter = leak(|_, _, _| panic!("filter failed"));
         let payload = Bytes::from(vec![b'x'; BLOCKING_THRESHOLD]);
-        let err = outbound_with(Some(filter), &subject, None, payload)
+        let err = outbound_with(Some(filter), subject, None, payload)
             .await
             .unwrap_err();
         assert!(err.is_panic());

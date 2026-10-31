@@ -378,12 +378,17 @@ pub type PublishMessage = crate::message::OutboundMessage;
 /// `Command` represents all commands that a [`Client`] can handle
 #[derive(Debug)]
 pub(crate) enum Command {
-    Publish(OutboundMessage),
+    /// `message` is built only by the outbound step, so every publish has
+    /// passed it.
+    Publish {
+        message: outbound::Filtered,
+        reply: Option<Subject>,
+    },
+    /// `message` is built only by the outbound step, so every request has
+    /// passed it.
     Request {
-        subject: Subject,
-        payload: Bytes,
+        message: outbound::Filtered,
         respond: Subject,
-        headers: Option<HeaderMap>,
         sender: oneshot::Sender<Message>,
     },
     Subscribe {
@@ -881,12 +886,11 @@ impl ConnectionHandler {
                 });
             }
             Command::Request {
-                subject,
-                payload,
+                message,
                 respond,
-                headers,
                 sender,
             } => {
+                let (subject, headers, payload) = message.into_parts();
                 let (prefix, token) = respond.rsplit_once('.').expect("malformed request subject");
 
                 let multiplexer = if let Some(multiplexer) = self.multiplexer.as_mut() {
@@ -926,12 +930,11 @@ impl ConnectionHandler {
                 self.connection.enqueue_write_op(&pub_op);
             }
 
-            Command::Publish(OutboundMessage {
-                subject,
-                payload,
+            Command::Publish {
+                message,
                 reply: respond,
-                headers,
-            }) => {
+            } => {
+                let (subject, headers, payload) = message.into_parts();
                 self.connector
                     .connect_stats
                     .out_messages
@@ -1828,7 +1831,6 @@ macro_rules! from_with_timeout {
 pub(crate) use from_with_timeout;
 
 use crate::connection::ShouldFlush;
-use crate::message::OutboundMessage;
 
 #[cfg(test)]
 mod tests {
