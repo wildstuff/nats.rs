@@ -23,6 +23,29 @@
 //! The filter holds every rule; this module holds none. It is set once per
 //! process with [`set_outbound_filter`]. Unset, every message goes out
 //! exactly as given.
+//!
+//! # Order
+//!
+//! When a filter is set, a body of [`BLOCKING_THRESHOLD`] bytes (64 KiB) or
+//! more leaves the caller's future for Tokio's blocking pool and comes back
+//! when the filter is done. So concurrent sends from one task, such as two
+//! publishes under `tokio::join!`, can reach the server in another order
+//! than they were started. Sends awaited one after the other keep their
+//! order, and so do sends through the client's `Sink`, which filters inline.
+//!
+//! # A filter must not panic
+//!
+//! Nothing here catches a panic. In a build with `panic = "abort"`, as
+//! Wild's release builds are, a panicking filter aborts the process on all
+//! three paths below. With `panic = "unwind"`:
+//!
+//! - inline (a smaller body, or no runtime current): the panic unwinds the
+//!   caller's task;
+//! - the `Sink`: the panic unwinds the caller's task;
+//! - the blocking pool: the send returns its error (a publish or request
+//!   error) with the panic as its source.
+//!
+//! On every path the message is not sent.
 
 use std::sync::OnceLock;
 
@@ -40,6 +63,7 @@ pub type Outgoing = (Option<HeaderMap>, Bytes);
 ///
 /// It runs synchronously. A body of [`BLOCKING_THRESHOLD`] bytes or more is
 /// passed to it on Tokio's blocking pool when a runtime is current.
+/// It must not panic: see [the module doc](self#a-filter-must-not-panic).
 pub type OutboundFilter = dyn Fn(&str, Option<HeaderMap>, Bytes) -> Outgoing + Send + Sync;
 
 /// A body this size or larger is filtered on the blocking pool when a
