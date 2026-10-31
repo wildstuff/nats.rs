@@ -85,6 +85,11 @@ fn max_payload_error(sizes: (usize, usize)) -> PublishError {
     )
 }
 
+/// `map_err` helper turning a failed outbound filter into a [`PublishError`].
+fn outbound_error(err: tokio::task::JoinError) -> PublishError {
+    PublishError::with_source(PublishErrorKind::Send, err)
+}
+
 /// Client is a `Cloneable` handle to NATS connection.
 /// Client should not be created directly. Instead, one of two methods can be used:
 /// [crate::connect] and [crate::ConnectOptions::connect]
@@ -189,6 +194,21 @@ impl traits::Publisher for Client {
                 crate::subject::SubjectError::InvalidFormat,
             ));
         }
+        let OutboundMessage {
+            subject,
+            reply,
+            headers,
+            payload,
+        } = msg;
+        let (headers, payload) = crate::outbound::outbound(&subject, headers, payload)
+            .await
+            .map_err(outbound_error)?;
+        let msg = OutboundMessage {
+            subject,
+            reply,
+            payload,
+            headers,
+        };
         self.check_payload_size(msg.headers.as_ref(), msg.payload.len())
             .map_err(max_payload_error)?;
         self.sender
@@ -215,6 +235,14 @@ impl Sink<OutboundMessage> for Client {
     }
 
     fn start_send(mut self: Pin<&mut Self>, msg: OutboundMessage) -> Result<(), Self::Error> {
+        // `start_send` cannot await: the filter runs inline whatever the size.
+        let (headers, payload) =
+            crate::outbound::outbound_sync(&msg.subject, msg.headers, msg.payload);
+        let msg = OutboundMessage {
+            headers,
+            payload,
+            ..msg
+        };
         self.check_payload_size(msg.headers.as_ref(), msg.payload.len())
             .map_err(max_payload_error)?;
         self.poll_sender
@@ -455,7 +483,11 @@ impl Client {
             .maybe_validate_publish_subject(subject)
             .map_err(|e| PublishError::with_source(PublishErrorKind::InvalidSubject, e))?;
 
-        self.check_payload_size(None, payload.len())
+        let (headers, payload) = crate::outbound::outbound(&subject, None, payload)
+            .await
+            .map_err(outbound_error)?;
+
+        self.check_payload_size(headers.as_ref(), payload.len())
             .map_err(max_payload_error)?;
 
         self.sender
@@ -463,7 +495,7 @@ impl Client {
                 subject,
                 payload,
                 reply: None,
-                headers: None,
+                headers,
             }))
             .await?;
         Ok(())
@@ -498,7 +530,11 @@ impl Client {
             .maybe_validate_publish_subject(subject)
             .map_err(|e| PublishError::with_source(PublishErrorKind::InvalidSubject, e))?;
 
-        self.check_payload_size(Some(&headers), payload.len())
+        let (headers, payload) = crate::outbound::outbound(&subject, Some(headers), payload)
+            .await
+            .map_err(outbound_error)?;
+
+        self.check_payload_size(headers.as_ref(), payload.len())
             .map_err(max_payload_error)?;
 
         self.sender
@@ -506,7 +542,7 @@ impl Client {
                 subject,
                 payload,
                 reply: None,
-                headers: Some(headers),
+                headers,
             }))
             .await?;
         Ok(())
@@ -541,7 +577,11 @@ impl Client {
             .maybe_validate_publish_subject(reply)
             .map_err(|e| PublishError::with_source(PublishErrorKind::InvalidSubject, e))?;
 
-        self.check_payload_size(None, payload.len())
+        let (headers, payload) = crate::outbound::outbound(&subject, None, payload)
+            .await
+            .map_err(outbound_error)?;
+
+        self.check_payload_size(headers.as_ref(), payload.len())
             .map_err(max_payload_error)?;
 
         self.sender
@@ -549,7 +589,7 @@ impl Client {
                 subject,
                 payload,
                 reply: Some(reply),
-                headers: None,
+                headers,
             }))
             .await?;
         Ok(())
@@ -587,7 +627,11 @@ impl Client {
             .maybe_validate_publish_subject(reply)
             .map_err(|e| PublishError::with_source(PublishErrorKind::InvalidSubject, e))?;
 
-        self.check_payload_size(Some(&headers), payload.len())
+        let (headers, payload) = crate::outbound::outbound(&subject, Some(headers), payload)
+            .await
+            .map_err(outbound_error)?;
+
+        self.check_payload_size(headers.as_ref(), payload.len())
             .map_err(max_payload_error)?;
 
         self.sender
@@ -595,7 +639,7 @@ impl Client {
                 subject,
                 payload,
                 reply: Some(reply),
-                headers: Some(headers),
+                headers,
             }))
             .await?;
         Ok(())
@@ -671,29 +715,46 @@ impl Client {
             .maybe_validate_publish_subject(subject)
             .map_err(|e| RequestError::with_source(RequestErrorKind::InvalidSubject, e))?;
 
-        // Reject oversized requests up front, else they'd be sent and time out.
-        self.check_payload_size(
-            request.headers.as_ref(),
-            request.payload.as_ref().map_or(0, Bytes::len),
+        // The one outbound step of this request, on both paths below.
+        let (headers, payload) = crate::outbound::outbound(
+            &subject,
+            request.headers,
+            request.payload.unwrap_or_default(),
         )
-        .map_err(|sizes| {
-            RequestError::with_source(
-                RequestErrorKind::MaxPayloadExceeded,
-                max_payload_message(sizes),
-            )
-        })?;
+        .await
+        .map_err(|err| RequestError::with_source(RequestErrorKind::Other, err))?;
+
+        // Reject oversized requests up front, else they'd be sent and time out.
+        self.check_payload_size(headers.as_ref(), payload.len())
+            .map_err(|sizes| {
+                RequestError::with_source(
+                    RequestErrorKind::MaxPayloadExceeded,
+                    max_payload_message(sizes),
+                )
+            })?;
 
         if let Some(inbox) = request.inbox {
             let timeout = request.timeout.unwrap_or(self.request_timeout);
-            let mut subscriber = self.subscribe(inbox.clone()).await?;
-            let payload: Bytes = request.payload.unwrap_or_default();
-            match request.headers {
-                Some(headers) => {
-                    self.publish_with_reply_and_headers(subject, inbox, headers, payload)
-                        .await?
-                }
-                None => self.publish_with_reply(subject, inbox, payload).await?,
-            }
+            let reply = self
+                .maybe_validate_publish_subject(inbox.clone())
+                .map_err(|e| {
+                    RequestError::with_source(
+                        RequestErrorKind::Other,
+                        PublishError::with_source(PublishErrorKind::InvalidSubject, e),
+                    )
+                })?;
+            let mut subscriber = self.subscribe(inbox).await?;
+            // Already filtered above: sent as it is, not through `publish_*`,
+            // which would filter it a second time.
+            self.sender
+                .send(Command::Publish(OutboundMessage {
+                    subject,
+                    payload,
+                    reply: Some(reply),
+                    headers,
+                }))
+                .await
+                .map_err(|err| RequestError::with_source(RequestErrorKind::Other, err))?;
             let request = match timeout {
                 Some(timeout) => {
                     tokio::time::timeout(timeout, subscriber.next())
@@ -720,9 +781,7 @@ impl Client {
         } else {
             let (sender, receiver) = oneshot::channel();
 
-            let payload = request.payload.unwrap_or_default();
             let respond = self.new_inbox().into();
-            let headers = request.headers;
 
             self.sender
                 .send(Command::Request {

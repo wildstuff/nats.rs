@@ -272,6 +272,7 @@ mod id_generator;
 #[cfg_attr(docsrs, doc(cfg(feature = "jetstream")))]
 pub mod jetstream;
 pub mod message;
+pub mod outbound;
 #[cfg(feature = "service")]
 #[cfg_attr(docsrs, doc(cfg(feature = "service")))]
 pub mod service;

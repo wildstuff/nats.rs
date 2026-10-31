@@ -490,10 +490,15 @@ impl Context {
             .maybe_validate_publish_subject(subject)
             .map_err(|e| PublishError::with_source(PublishErrorKind::Other, e))?;
 
+        let (headers, payload) =
+            crate::outbound::outbound(&subject, publish.headers, publish.payload)
+                .await
+                .map_err(|err| PublishError::with_source(PublishErrorKind::Other, err))?;
+
         // Reject oversized messages before taking an ack permit, else the
         // publish is sent and we wait for an ack that never arrives.
         self.client
-            .check_payload_size(publish.headers.as_ref(), publish.payload.len())
+            .check_payload_size(headers.as_ref(), payload.len())
             .map_err(|sizes| {
                 PublishError::with_source(
                     PublishErrorKind::MaxPayloadExceeded,
@@ -530,9 +535,9 @@ impl Context {
             .sender
             .send(Command::Request {
                 subject,
-                payload: publish.payload,
+                payload,
                 respond,
-                headers: publish.headers,
+                headers,
                 sender,
             })
             .map_err(|err| PublishError::with_source(PublishErrorKind::Other, err));
