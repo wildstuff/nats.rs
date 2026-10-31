@@ -65,6 +65,17 @@ impl std::error::Error for OutboundFilterAlreadySet {}
 ///
 /// Every client in the process passes every message it sends through the
 /// filter from then on.
+///
+/// # Examples
+/// ```
+/// // Set once, early in `main`, before the first client sends.
+/// async_nats::outbound::set_outbound_filter(|_subject, headers, payload| {
+///     // Answer what to send: here, the message as given.
+///     (headers, payload)
+/// })
+/// .expect("set once");
+/// assert!(async_nats::outbound::outbound_filter_is_set());
+/// ```
 pub fn set_outbound_filter<F>(filter: F) -> Result<(), OutboundFilterAlreadySet>
 where
     F: Fn(&str, Option<HeaderMap>, Bytes) -> Outgoing + Send + Sync + 'static,
